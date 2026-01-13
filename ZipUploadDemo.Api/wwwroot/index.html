@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Zip 上传管理系统</title>
+        <link
+            href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+            rel="stylesheet"
+        />
+        <link 
+            rel="stylesheet" 
+            href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css"
+        />
+        <style>
+            [v-cloak] { display: none; }
+            .status-parsed { color: green; font-weight: bold; }
+            .status-missing { color: orange; font-weight: bold; }
+            .status-invalid { color: red; font-weight: bold; }
+            .loading-overlay {
+                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                background: rgba(255, 255, 255, 0.8); z-index: 9999;
+                display: flex; justify-content: center; align-items: center;
+            }
+            .status-badge { font-size: 0.85em; padding: 0.35em 0.65em; }
+            .progress-bar-animated { animation: progress-bar-stripes 1s linear infinite; }
+            .job-card { transition: all 0.3s ease; }
+            .job-card:hover { box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.15); transform: translateY(-2px); }
+            .fade-enter-active, .fade-leave-active { transition: opacity 0.3s ease; }
+            .fade-enter-from, .fade-leave-to { opacity: 0; }
+        </style>
+    </head>
+    <body>
+        <div id="app" v-cloak>
+            <!-- 导航栏 -->
+            <nav class="navbar navbar-expand-lg navbar-dark bg-primary mb-4 shadow-sm">
+                <div class="container">
+                    <a class="navbar-brand" href="#">
+                        <i class="bi bi-file-earmark-zip-fill me-2"></i>Zip 上传管理系统
+                    </a>
+                    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                        <span class="navbar-toggler-icon"></span>
+                    </button>
+                    <div class="collapse navbar-collapse" id="navbarNav">
+                        <ul class="navbar-nav ms-auto">
+                            <li class="nav-item">
+                                <a class="nav-link" :class="{active: currentView === 'upload'}" href="#" @click.prevent="currentView = 'upload'">
+                                    <i class="bi bi-cloud-upload me-1"></i>文件上传
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a class="nav-link" :class="{active: currentView === 'history'}" href="#" @click.prevent="loadHistory()">
+                                    <i class="bi bi-clock-history me-1"></i>上传履历
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a class="nav-link position-relative" :class="{active: currentView === 'jobs'}" href="#" @click.prevent="loadJobs()">
+                                    <i class="bi bi-list-task me-1"></i>任务队列
+                                    <span class="position-absolute top-0 start-100 translate-middle badge rounded-pill bg-danger" v-if="queueStats.processing > 0">
+                                        {{ queueStats.processing }}
+                                        <span class="visually-hidden">处理中任务</span>
+                                    </span>
+                                </a>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+            </nav>
+
+            <div class="container">
+                <!-- 全局错误提示 -->
+                <div v-if="errorMessage" class="alert alert-danger alert-dismissible fade show" role="alert">
+                    <i class="bi bi-exclamation-triangle-fill me-2"></i>{{ errorMessage }}
+                    <button type="button" class="btn-close" @click="errorMessage = ''"></button>
+                </div>
+
+                <!-- 加载遮罩 -->
+                <div v-if="loading" class="loading-overlay">
+                    <div class="text-center">
+                        <div class="spinner-border text-primary" style="width: 3rem; height: 3rem;" role="status"></div>
+                        <p class="mt-2 text-primary fw-bold">处理中...</p>
+                    </div>
+                </div>
+
+                <!-- 上传视图 -->
+                <transition name="fade" mode="out-in">
+                    <div v-if="currentView === 'upload'" key="upload">
+                        <div class="row justify-content-center">
+                            <div class="col-lg-8">
+                                <div class="card shadow border-0">
+                                    <div class="card-header bg-white py-3">
+                                        <h4 class="mb-0 text-primary"><i class="bi bi-upload me-2"></i>上传 Zip 文件</h4>
+                                    </div>
+                                    <div class="card-body p-4">
+                                        <div class="mb-4">
+                                            <label for="zipFile" class="form-label fw-bold">选择文件</label>
+                                            <div class="input-group input-group-lg">
+                                                <input class="form-control" type="file" id="zipFile" ref="fileInput" accept=".zip" @change="handleFileSelect">
+                                                <button class="btn btn-primary px-4" @click="uploadFile" :disabled="loading || !selectedFile">
+                                                    <i class="bi bi-cloud-arrow-up-fill me-2"></i>开始上传
+                                                </button>
+                                            </div>
+                                            <div class="form-text text-muted mt-2">
+                                                <i class="bi bi-info-circle me-1"></i>
+                                                包含 Excel 数据与 PDF 附件的 Zip 包。大于 <strong>10MB</strong> 的文件将自动转入后台处理。
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- 实时任务监控 (异步上传) -->
+                                <div v-if="currentMonitoredJob" class="card mt-4 shadow-sm border-info">
+                                    <div class="card-header bg-info text-white d-flex justify-content-between align-items-center">
+                                        <h5 class="mb-0"><i class="bi bi-gear-wide-connected me-2"></i>后台处理进度</h5>
+                                        <span class="badge bg-light text-dark">{{ getJobStatusText(currentMonitoredJob.status) }}</span>
+                                    </div>
+                                    <div class="card-body">
+                                        <p><strong>文件名:</strong> {{ currentMonitoredJob.originalFileName }}</p>
+                                        <p class="small text-muted mb-2">任务 ID: {{ currentMonitoredJob.jobId }}</p>
+                                        
+                                        <div class="progress mb-3" style="height: 25px;">
+                                            <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                                                 :class="getProgressBarClass(currentMonitoredJob.status)"
+                                                 :style="{width: currentMonitoredJob.progress + '%'}">
+                                                {{ currentMonitoredJob.progress }}%
+                                            </div>
+                                        </div>
+
+                                        <div v-if="currentMonitoredJob.status === 4" class="alert alert-success d-flex justify-content-between align-items-center">
+                                            <span><i class="bi bi-check-circle-fill me-2"></i>处理完成!</span>
+                                            <button class="btn btn-sm btn-success" @click="viewBatchDetails(currentMonitoredJob.batchId)" v-if="currentMonitoredJob.batchId">
+                                                查看结果详情
+                                            </button>
+                                        </div>
+                                        <div v-else-if="currentMonitoredJob.status === 5" class="alert alert-danger">
+                                            <strong><i class="bi bi-x-circle-fill me-2"></i>失败:</strong> {{ currentMonitoredJob.errorMessage }}
+                                        </div>
+                                        <div v-else class="text-center text-muted">
+                                            <small>请稍候，系统正在处理您的文件...</small>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- 同步上传结果 -->
+                                <div v-if="uploadResult" class="card mt-4 shadow border-success">
+                                    <div class="card-header bg-success text-white">
+                                        <h5 class="mb-0"><i class="bi bi-check-lg me-2"></i>上传成功</h5>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="row text-center g-3 mb-4">
+                                            <div class="col-md-3 col-6">
+                                                <div class="p-3 border rounded bg-light">
+                                                    <div class="text-muted small">总行数</div>
+                                                    <div class="h3 mb-0">{{ uploadResult.totalRows }}</div>
+                                                </div>
+                                            </div>
+                                            <div class="col-md-3 col-6">
+                                                <div class="p-3 border rounded bg-success-subtle text-success">
+                                                    <div class="small fw-bold">成功解析</div>
+                                                    <div class="h3 mb-0">{{ uploadResult.parsedRows }}</div>
+                                                </div>
+                                            </div>
+                                            <div class="col-md-3 col-6">
+                                                <div class="p-3 border rounded bg-warning-subtle text-warning">
+                                                    <div class="small fw-bold">缺失 PDF</div>
+                                                    <div class="h3 mb-0">{{ uploadResult.missingPdfRows }}</div>
+                                                </div>
+                                            </div>
+                                            <div class="col-md-3 col-6">
+                                                <div class="p-3 border rounded bg-danger-subtle text-danger">
+                                                    <div class="small fw-bold">无效行</div>
+                                                    <div class="h3 mb-0">{{ uploadResult.invalidRows }}</div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="d-flex justify-content-between align-items-center">
+                                            <div>
+                                                <strong>批次号:</strong> {{ uploadResult.batchNo }}
+                                            </div>
+                                            <button class="btn btn-outline-primary btn-sm" @click="viewDetails({id: uploadResult.batchId, batchNo: uploadResult.batchNo})">
+                                                查看详细数据
+                                            </button>
+                                        </div>
+
+                                        <!-- 错误列表 Preview -->
+                                        <div v-if="uploadResult.errors && uploadResult.errors.length > 0" class="mt-3">
+                                            <h6 class="text-danger border-bottom pb-2">解析错误预览</h6>
+                                            <div class="table-responsive" style="max-height: 200px;">
+                                                <table class="table table-sm table-striped small">
+                                                    <thead>
+                                                        <tr><th>行</th><th>错误</th><th>内容</th></tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        <tr v-for="(err, idx) in uploadResult.errors" :key="idx">
+                                                            <td>{{ err.rowIndex }}</td>
+                                                            <td class="text-danger">{{ err.errorMessage }}</td>
+                                                            <td class="text-muted text-truncate" style="max-width: 200px;">{{ err.rawText }}</td>
+                                                        </tr>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </transition>
+
+                <!-- 任务队列视图 -->
+                <transition name="fade" mode="out-in">
+                    <div v-if="currentView === 'jobs'" key="jobs">
+                        <div class="d-flex justify-content-between align-items-center mb-4">
+                            <h3><i class="bi bi-list-check me-2"></i>后台任务队列</h3>
+                            <button class="btn btn-outline-primary btn-sm" @click="loadJobs()">
+                                <i class="bi bi-arrow-clockwise me-1"></i>刷新
+                            </button>
+                        </div>
+
+                        <!-- 队列统计 Dashboard -->
+                        <div class="row g-3 mb-4">
+                            <div class="col-md-3 col-sm-6">
+                                <div class="card h-100 border-primary border-start-4 shadow-sm">
+                                    <div class="card-body">
+                                        <div class="text-muted small text-uppercase fw-bold">总任务</div>
+                                        <div class="h2 mb-0 text-primary">{{ queueStats.total }}</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="card h-100 border-warning border-start-4 shadow-sm">
+                                    <div class="card-body">
+                                        <div class="text-muted small text-uppercase fw-bold">排队中</div>
+                                        <div class="h2 mb-0 text-warning">{{ queueStats.queued }}</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="card h-100 border-info border-start-4 shadow-sm">
+                                    <div class="card-body">
+                                        <div class="text-muted small text-uppercase fw-bold">处理中</div>
+                                        <div class="h2 mb-0 text-info">{{ queueStats.processing }}</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 col-sm-6">
+                                <div class="card h-100 border-success border-start-4 shadow-sm">
+                                    <div class="card-body">
+                                        <div class="text-muted small text-uppercase fw-bold">平均耗时</div>
+                                        <div class="h2 mb-0 text-success">{{ queueStats.averageProcessingTimeSeconds?.toFixed(1) || 0 }}s</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 任务列表 -->
+                        <div class="row g-3">
+                            <div class="col-lg-6" v-for="job in jobs" :key="job.jobId">
+                                <div class="card job-card h-100 border-0 shadow-sm">
+                                    <div class="card-body position-relative">
+                                        <div class="d-flex justify-content-between align-items-start mb-3">
+                                            <div>
+                                                <h5 class="card-title text-truncate" style="max-width: 250px;" :title="job.originalFileName">
+                                                    {{ job.originalFileName }}
+                                                </h5>
+                                                <span class="badge" :class="getJobStatusBadgeClass(job.status)">
+                                                    {{ getJobStatusText(job.status) }}
+                                                </span>
+                                            </div>
+                                            <div class="text-end small text-muted">
+                                                <div><i class="bi bi-calendar3 me-1"></i>{{ formatDate(job.createdAt) }}</div>
+                                            </div>
+                                        </div>
+
+                                        <!-- 进度条 -->
+                                        <div class="progress mb-2" style="height: 10px;" v-if="[0, 1, 2, 3].includes(job.status)">
+                                            <div class="progress-bar progress-bar-striped progress-bar-animated" 
+                                                 :class="getProgressBarClass(job.status)" 
+                                                 :style="{width: job.progress + '%'}">
+                                            </div>
+                                        </div>
+
+                                        <div v-if="job.status === 5" class="alert alert-danger py-2 small mb-2">
+                                            {{ job.errorMessage }}
+                                        </div>
+
+                                        <div class="d-flex justify-content-between align-items-center mt-3 pt-2 border-top">
+                                            <small class="text-muted">ID: ...{{ job.jobId.slice(-8) }}</small>
+                                            <button v-if="job.batchId && job.status === 4" class="btn btn-sm btn-outline-primary" @click="viewBatchDetails(job.batchId)">
+                                                查看详情 <i class="bi bi-arrow-right"></i>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div v-if="jobs.length === 0" class="text-center py-5 text-muted">
+                            <i class="bi bi-inbox fs-1 d-block mb-3"></i>
+                            暂无任务记录
+                        </div>
+                    </div>
+                </transition>
+
+                <!-- 历史记录视图 -->
+                <transition name="fade" mode="out-in">
+                    <div v-if="currentView === 'history'" key="history">
+                        <div class="d-flex justify-content-between align-items-center mb-4">
+                            <h3><i class="bi bi-clock-history me-2"></i>上传履历</h3>
+                            <div class="input-group w-auto">
+                                <input type="text" class="form-control" placeholder="搜索批次号..." v-model="historySearch" @keyup.enter="loadHistory(1)">
+                                <button class="btn btn-primary" @click="loadHistory(1)">
+                                    <i class="bi bi-search"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="card shadow-sm">
+                            <div class="table-responsive">
+                                <table class="table table-hover align-middle mb-0">
+                                    <thead class="bg-light">
+                                        <tr>
+                                            <th>ID</th>
+                                            <th>批次号</th>
+                                            <th>文件来源</th>
+                                            <th>统计 (行/PDF)</th>
+                                            <th>状态</th>
+                                            <th>上传时间</th>
+                                            <th>操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr v-for="batch in history.items" :key="batch.id">
+                                            <td>{{ batch.id }}</td>
+                                            <td class="fw-bold text-primary">{{ batch.batchNo }}</td>
+                                            <td>{{ batch.excelFileName }}</td>
+                                            <td>
+                                                <span class="badge bg-secondary me-1">{{ batch.totalRows }} 行</span>
+                                                <span class="badge bg-info">{{ batch.totalPdfs }} PDF</span>
+                                            </td>
+                                            <td>
+                                                <span class="badge" :class="getJobStatusBadgeClass(batch.status)">
+                                                    {{ getJobStatusText(batch.status) }}
+                                                </span>
+                                            </td>
+                                            <td>{{ formatDate(batch.createdAt) }}</td>
+                                            <td>
+                                                <button class="btn btn-sm btn-outline-info" @click="viewDetails(batch)">
+                                                    详情
+                                                </button>
+                                            </td>
+                                        </tr>
+                                        <tr v-if="history.items.length === 0">
+                                            <td colspan="7" class="text-center py-4 text-muted">暂无历史记录</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <!-- 分页组件 -->
+                        <nav class="mt-4" v-if="history.total > 0">
+                            <ul class="pagination justify-content-center">
+                                <li class="page-item" :class="{disabled: history.page <= 1}">
+                                    <button class="page-link" @click="loadHistory(history.page - 1)">上一页</button>
+                                </li>
+                                <li class="page-item disabled"><span class="page-link">第 {{ history.page }} 页 / 共 {{ Math.ceil(history.total / history.pageSize) }} 页</span></li>
+                                <li class="page-item" :class="{disabled: history.items.length < history.pageSize}">
+                                    <button class="page-link" @click="loadHistory(history.page + 1)">下一页</button>
+                                </li>
+                            </ul>
+                        </nav>
+                    </div>
+                </transition>
+
+                <!-- 详情视图 -->
+                <transition name="fade" mode="out-in">
+                    <div v-if="currentView === 'detail'" key="detail">
+                        <div class="mb-3">
+                            <button class="btn btn-secondary btn-sm" @click="currentView = 'history'">
+                                <i class="bi bi-arrow-left me-1"></i>返回列表
+                            </button>
+                        </div>
+
+                        <div class="card shadow border-0">
+                            <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center py-3">
+                                <h5 class="mb-0">
+                                    <i class="bi bi-table me-2"></i>批次详情
+                                    <span v-if="selectedBatch" class="opacity-75 ms-2">({{ selectedBatch.batchNo }})</span>
+                                </h5>
+                                <span class="badge bg-light text-primary">ID: {{ selectedBatch?.id }}</span>
+                            </div>
+                            <div class="card-body p-0">
+                                <div class="table-responsive">
+                                    <table class="table table-striped table-hover mb-0">
+                                        <thead class="bg-light">
+                                            <tr>
+                                                <th>行号</th>
+                                                <th>类型</th>
+                                                <th>产品信息</th>
+                                                <th>数量/编号</th>
+                                                <th>关联 PDF</th>
+                                                <th>解析状态</th>
+                                                <th>消息</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr v-for="entry in details.items" :key="entry.rowIndex">
+                                                <td>{{ entry.rowIndex }}</td>
+                                                <td><span class="badge bg-secondary">{{ entry.rowType }}</span></td>
+                                                <td>
+                                                    <div class="fw-bold">{{ entry.productName }}</div>
+                                                    <div class="small text-muted">{{ entry.model }}</div>
+                                                </td>
+                                                <td>
+                                                    <div>Qty: {{ entry.quantity }}</div>
+                                                    <div class="small font-monospace">{{ entry.serialNo }}</div>
+                                                </td>
+                                                <td>
+                                                    <span v-if="entry.pdfFileName"><i class="bi bi-file-pdf text-danger me-1"></i>{{ entry.pdfFileName }}</span>
+                                                    <span v-else class="text-muted">-</span>
+                                                </td>
+                                                <td :class="getStatusClass(entry.parseStatus)">
+                                                    <i class="bi" :class="getStatusIcon(entry.parseStatus)"></i>
+                                                    {{ getParseStatusText(entry.parseStatus) }}
+                                                </td>
+                                                <td class="text-danger small">{{ entry.errorMessage }}</td>
+                                            </tr>
+                                            <tr v-if="details.items.length === 0">
+                                                <td colspan="7" class="text-center py-4">该批次无数据或加载失败</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                            <div class="card-footer bg-light">
+                                <nav>
+                                    <ul class="pagination justify-content-center mb-0">
+                                        <li class="page-item" :class="{disabled: details.page <= 1}">
+                                            <button class="page-link" @click="loadDetails(selectedBatch?.id, details.page - 1)">上一页</button>
+                                        </li>
+                                        <li class="page-item disabled"><span class="page-link">第 {{ details.page }} 页</span></li>
+                                        <li class="page-item" :class="{disabled: details.items.length < details.pageSize}">
+                                            <button class="page-link" @click="loadDetails(selectedBatch?.id, details.page + 1)">下一页</button>
+                                        </li>
+                                    </ul>
+                                </nav>
+                            </div>
+                        </div>
+                    </div>
+                </transition>
+            </div>
+        </div>
+
+        <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+
+        <script>
+            const { createApp, ref, reactive, onMounted, onUnmounted } = Vue;
+
+            createApp({
+                setup() {
+                    const currentView = ref('upload');
+                    const loading = ref(false);
+                    const errorMessage = ref('');
+                    const fileInput = ref(null);
+                    const selectedFile = ref(null);
+                    
+                    // Upload State
+                    const uploadResult = ref(null);
+                    const currentMonitoredJob = ref(null); // The specific job we are watching in Upload view
+                    let monitorInterval = null;
+
+                    // History State
+                    const history = reactive({ items: [], total: 0, page: 1, pageSize: 10 });
+                    const historySearch = ref('');
+
+                    // Details State
+                    const selectedBatch = ref(null);
+                    const details = reactive({ items: [], total: 0, page: 1, pageSize: 50 });
+
+                    // Jobs State
+                    const jobs = ref([]);
+                    const queueStats = reactive({ total: 0, queued: 0, processing: 0, completed: 0, failed: 0, averageProcessingTimeSeconds: 0 });
+                    let jobListRefreshInterval = null;
+
+                    // --- Utilities ---
+                    const formatDate = (dateStr) => {
+                        if (!dateStr) return '-';
+                        return new Date(dateStr).toLocaleString('zh-CN', {
+                            year: 'numeric', month: '2-digit', day: '2-digit',
+                            hour: '2-digit', minute: '2-digit', second: '2-digit'
+                        });
+                    };
+
+                    const showError = (msg) => {
+                        errorMessage.value = msg;
+                        setTimeout(() => errorMessage.value = '', 5000);
+                    };
+
+                    const handleFileSelect = (event) => {
+                        selectedFile.value = event.target.files[0];
+                        uploadResult.value = null;
+                        currentMonitoredJob.value = null;
+                    };
+
+                    // --- Actions ---
+
+                    const uploadFile = async () => {
+                        if (!selectedFile.value) {
+                            showError("请先选择文件");
+                            return;
+                        }
+
+                        const formData = new FormData();
+                        formData.append('file', selectedFile.value);
+
+                        loading.value = true;
+                        errorMessage.value = '';
+                        uploadResult.value = null;
+                        currentMonitoredJob.value = null;
+
+                        try {
+                            const res = await axios.post('/api/upload', formData, {
+                                headers: { 'Content-Type': 'multipart/form-data' }
+                            });
+
+                            if (res.data?.jobId) {
+                                // Async Upload Started
+                                startJobMonitoring(res.data.jobId);
+                            } else {
+                                // Sync Upload Completed
+                                uploadResult.value = res.data;
+                            }
+                            // Don't clear file input immediately so user sees what they uploaded
+                        } catch (error) {
+                            console.error(error);
+                            showError("上传失败: " + (error.response?.data?.message || error.message));
+                        } finally {
+                            loading.value = false;
+                        }
+                    };
+
+                    const startJobMonitoring = (jobId) => {
+                        // Initial dummy state
+                        currentMonitoredJob.value = {
+                            jobId: jobId,
+                            status: 0,
+                            progress: 0,
+                            originalFileName: selectedFile.value?.name || 'Unknown'
+                        };
+                        
+                        // Clear existing monitor if any
+                        if (monitorInterval) clearInterval(monitorInterval);
+
+                        // Poll every 1s
+                        monitorInterval = setInterval(async () => {
+                            try {
+                                const res = await axios.get(`/api/backgroundupload/jobs/${jobId}`);
+                                currentMonitoredJob.value = res.data;
+
+                                // Stop if terminal state
+                                if (res.data.status === 4 || res.data.status === 5) {
+                                    clearInterval(monitorInterval);
+                                    monitorInterval = null;
+                                    // Refresh global job stats if we finished
+                                    loadJobStats(); 
+                                }
+                            } catch (e) {
+                                console.error("Monitor failed", e);
+                            }
+                        }, 1000);
+                    };
+
+                    const loadHistory = async (page = 1) => {
+                        loading.value = true;
+                        currentView.value = 'history';
+                        history.page = page;
+                        try {
+                            const res = await axios.get('/api/upload/batches', {
+                                params: { batchNo: historySearch.value, page, pageSize: history.pageSize }
+                            });
+                            history.items = res.data?.items || [];
+                            history.total = res.data?.total || 0;
+                        } catch (error) {
+                            showError("无法加载历史记录");
+                        } finally {
+                            loading.value = false;
+                        }
+                    };
+
+                    const viewDetails = (batch) => {
+                        selectedBatch.value = batch; // batch object might be partial
+                        loadDetails(batch.id, 1);
+                    };
+
+                    const loadDetails = async (batchId, page = 1) => {
+                        loading.value = true;
+                        currentView.value = 'detail';
+                        details.page = page;
+                        // Ensure selectedBatch has at least the ID
+                        if (!selectedBatch.value || selectedBatch.value.id !== batchId) {
+                             selectedBatch.value = { id: batchId, batchNo: 'Loading...' };
+                        }
+
+                        try {
+                            const res = await axios.get(`/api/upload/batches/${batchId}/entries`, {
+                                params: { page, pageSize: details.pageSize }
+                            });
+                            details.items = res.data?.items || [];
+                            details.total = res.data?.total || 0;
+                        } catch (error) {
+                            showError("无法加载详情");
+                        } finally {
+                            loading.value = false;
+                        }
+                    };
+
+                    const viewBatchDetails = (batchId) => {
+                         // Directly go to details view
+                         viewDetails({ id: batchId, batchNo: '查询中...' });
+                    };
+
+                    // --- Job Queue Logic ---
+
+                    const loadJobStats = async () => {
+                         try {
+                             const res = await axios.get('/api/backgroundupload/jobs/stats');
+                             Object.assign(queueStats, res.data);
+                         } catch(e) {}
+                    };
+
+                    const loadJobs = async () => {
+                        loading.value = true;
+                        currentView.value = 'jobs';
+                        try {
+                            const [jobsRes, statsRes] = await Promise.all([
+                                axios.get('/api/backgroundupload/jobs'),
+                                axios.get('/api/backgroundupload/jobs/stats')
+                            ]);
+                            jobs.value = jobsRes.data || [];
+                            Object.assign(queueStats, statsRes.data || {});
+                        } catch (error) {
+                            showError("无法加载任务队列");
+                        } finally {
+                            loading.value = false;
+                        }
+                    };
+
+                    // --- Auto Refresh Logic ---
+                    onMounted(() => {
+                        // Global stats poller (every 10s)
+                        setInterval(() => {
+                             if(currentView.value !== 'jobs') loadJobStats();
+                        }, 10000);
+
+                        // Jobs view active poller (every 3s)
+                        jobListRefreshInterval = setInterval(() => {
+                            if (currentView.value === 'jobs') {
+                                // Background refresh (no loading spinner)
+                                axios.get('/api/backgroundupload/jobs').then(r => jobs.value = r.data).catch(()=>{});
+                                axios.get('/api/backgroundupload/jobs/stats').then(r => Object.assign(queueStats, r.data)).catch(()=>{});
+                            }
+                        }, 3000);
+                    });
+
+                    onUnmounted(() => {
+                        if (monitorInterval) clearInterval(monitorInterval);
+                        if (jobListRefreshInterval) clearInterval(jobListRefreshInterval);
+                    });
+
+                    // --- Display Helpers ---
+                    const getJobStatusText = (status) => {
+                        return {0: "等待中", 1: "处理中", 2: "已上传", 3: "已解析", 4: "已完成", 5: "失败"}[status] || "未知";
+                    };
+                    const getJobStatusBadgeClass = (status) => {
+                        return {0: "bg-secondary", 1: "bg-primary", 2: "bg-info", 3: "bg-info", 4: "bg-success", 5: "bg-danger"}[status] || "bg-secondary";
+                    };
+                    const getProgressBarClass = (status) => {
+                        return {1: "bg-primary", 2: "bg-info", 3: "bg-success", 4: "bg-success"}[status] || "bg-primary";
+                    };
+                    const getStatusClass = (status) => {
+                        return {1: 'status-parsed', 2: 'status-missing', 3: 'status-invalid'}[status] || '';
+                    };
+                    const getStatusIcon = (status) => {
+                        return {1: 'bi-check-circle', 2: 'bi-exclamation-circle', 3: 'bi-x-circle'}[status] || 'bi-circle';
+                    };
+                    const getParseStatusText = (status) => {
+                         return {0: "未解析", 1: "解析成功", 2: "缺失 PDF", 3: "无效数据"}[status] || "未知";
+                    };
+
+                    return {
+                        currentView, loading, errorMessage,
+                        fileInput, selectedFile, handleFileSelect, uploadFile,
+                        uploadResult, currentMonitoredJob,
+                        history, historySearch, loadHistory,
+                        selectedBatch, details, viewDetails, loadDetails, viewBatchDetails,
+                        jobs, queueStats, loadJobs,
+                        formatDate, getJobStatusText, getJobStatusBadgeClass, getProgressBarClass, getStatusClass, getStatusIcon, getParseStatusText
+                    };
+                }
+            }).mount('#app');
+        </script>
+    </body>
+</html>
