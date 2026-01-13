@@ -19,4 +19,14 @@ public class StorageOptions
     /// 默认 10MB
     /// </summary>
     public int AsyncFileSizeThresholdMB { get; set; } = 10;
+
+    /// <summary>
+    /// 后台任务失败后是否清理工作目录，默认清理以避免磁盘堆积
+    /// </summary>
+    public bool CleanupWorkspaceOnFailure { get; set; } = true;
+
+    /// <summary>
+    /// 后台任务失败时是否抛出异常触发 CAP 重试，默认不重试
+    /// </summary>
+    public bool RetryOnFailure { get; set; } = false;
 }

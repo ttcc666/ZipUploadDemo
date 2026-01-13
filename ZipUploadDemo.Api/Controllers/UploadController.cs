@@ -46,23 +46,39 @@ public class UploadController : ControllerBase
     {
         try
         {
+            if (file == null || file.Length == 0)
+            {
+                return BadRequest(new { message = "上传文件为空" });
+            }
+
+            var safeFileName = Path.GetFileName(file.FileName);
+            if (string.IsNullOrWhiteSpace(safeFileName))
+            {
+                return BadRequest(new { message = "上传文件名无效" });
+            }
+
             // 判断是否需要异步处理
-            var fileSizeMB = file.Length / (1024 * 1024);
+            var fileSizeMB = file.Length / 1024d / 1024d;
             var useAsync = _storageOptions.EnableBackgroundProcessing &&
                           fileSizeMB >= _storageOptions.AsyncFileSizeThresholdMB;
 
             if (useAsync)
             {
-                _logger.LogInformation("大文件检测到，使用异步处理: {FileName} ({Size}MB)", file.FileName, fileSizeMB);
+                _logger.LogInformation("大文件检测到，使用异步处理: {FileName} ({Size}MB)", safeFileName, fileSizeMB);
 
                 // 保存文件到临时工作目录
                 var workspace = PrepareWorkspace();
-                var savedZip = Path.Combine(workspace, file.FileName);
+                var savedZip = Path.Combine(workspace, safeFileName);
 
-                await using (var fs = new FileStream(savedZip, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 81920))
+                await using var fs = new FileStream(savedZip, new FileStreamOptions
                 {
-                    await file.CopyToAsync(fs, cancellationToken);
-                }
+                    Mode = FileMode.Create,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None,
+                    BufferSize = 81920,
+                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan
+                });
+                await file.CopyToAsync(fs, cancellationToken);
 
                 var jobId = Guid.NewGuid().ToString("N");
 
@@ -70,7 +86,7 @@ public class UploadController : ControllerBase
                 var jobEntity = new UploadJobEntity
                 {
                     JobId = jobId,
-                    OriginalFileName = file.FileName,
+                    OriginalFileName = safeFileName,
                     ZipFilePath = savedZip,
                     Workspace = workspace,
                     Status = UploadStatus.Queued,
@@ -85,7 +101,7 @@ public class UploadController : ControllerBase
                     JobId = jobId,
                     Workspace = workspace,
                     ZipFilePath = savedZip,
-                    OriginalFileName = file.FileName,
+                    OriginalFileName = safeFileName,
                     Status = UploadStatus.Queued,
                     CreatedAt = DateTime.UtcNow
                 });
@@ -100,7 +116,7 @@ public class UploadController : ControllerBase
             else
             {
                 // 小文件同步处理
-                _logger.LogInformation("小文件同步处理: {FileName} ({Size}MB)", file.FileName, fileSizeMB);
+                _logger.LogInformation("小文件同步处理: {FileName} ({Size}MB)", safeFileName, fileSizeMB);
                 var result = await _processing.ProcessAsync(file, cancellationToken);
                 return Ok(result);
             }

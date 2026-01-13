@@ -1,7 +1,6 @@
 using System.IO.Compression;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Http;
-using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
 using MiniExcelLibs;
 using SqlSugar;
@@ -40,28 +39,55 @@ public class UploadProcessingService
             throw new ArgumentException("上传文件为空", nameof(zipFile));
         }
 
+        var safeFileName = Path.GetFileName(zipFile.FileName);
+        if (string.IsNullOrWhiteSpace(safeFileName))
+        {
+            throw new ArgumentException("上传文件名无效", nameof(zipFile));
+        }
+
         var workspace = PrepareWorkspace();
-        var savedZip = Path.Combine(workspace, zipFile.FileName);
+        var savedZip = Path.Combine(workspace, safeFileName);
 
         // 使用优化的缓冲区大小（80KB）提升大文件上传性能
-        await using (var fs = new FileStream(savedZip, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 81920))
+        await using var fs = new FileStream(savedZip, new FileStreamOptions
         {
-            await zipFile.CopyToAsync(fs, cancellationToken);
+            Mode = FileMode.Create,
+            Access = FileAccess.Write,
+            Share = FileShare.None,
+            BufferSize = 81920,
+            Options = FileOptions.Asynchronous | FileOptions.SequentialScan
+        });
+        await zipFile.CopyToAsync(fs, cancellationToken);
+
+        return await ProcessSavedZipAsync(savedZip, safeFileName, workspace, cancellationToken);
+    }
+
+    public async Task<UploadResultDto> ProcessSavedZipAsync(
+        string zipFilePath,
+        string originalFileName,
+        string workspace,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(zipFilePath))
+        {
+            throw new ArgumentException("压缩包路径无效", nameof(zipFilePath));
         }
+
+        if (!File.Exists(zipFilePath))
+        {
+            throw new FileNotFoundException($"文件不存在: {zipFilePath}");
+        }
+
+        var safeFileName = Path.GetFileName(originalFileName);
+        if (string.IsNullOrWhiteSpace(safeFileName))
+        {
+            safeFileName = Path.GetFileName(zipFilePath);
+        }
+
+        Directory.CreateDirectory(workspace);
 
         var extractPath = Path.Combine(workspace, "extract");
-        ZipFile.ExtractToDirectory(savedZip, extractPath);
-
-        // 解压完成后删除原始ZIP文件，释放磁盘空间
-        try
-        {
-            File.Delete(savedZip);
-            _logger.LogInformation("已删除原始ZIP文件: {FileName}", zipFile.FileName);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "删除ZIP文件失败: {FileName}", zipFile.FileName);
-        }
+        ZipFile.ExtractToDirectory(zipFilePath, extractPath);
 
         // 并行查找 Excel 和 PDF 文件，提升文件枚举性能
         var excelPathTask = Task.Run(() =>
@@ -85,7 +111,7 @@ public class UploadProcessingService
 
         var batch = new UploadBatch
         {
-            BatchNo = prefix ?? Path.GetFileNameWithoutExtension(zipFile.FileName),
+            BatchNo = prefix ?? Path.GetFileNameWithoutExtension(safeFileName),
             ExcelFileName = Path.GetFileName(excelPath),
             ExcelPath = excelPath,
             TotalRows = parseRows.Count,
@@ -95,9 +121,10 @@ public class UploadProcessingService
             UpdatedAt = DateTime.UtcNow
         };
 
-        var pdfLookup = pdfFiles.ToDictionary(f => Path.GetFileName(f).ToLowerInvariant(), f => f);
-        var entries = BuildEntries(parseRows, prefix, pdfLookup, extractPath);
+        var pdfLookup = BuildPdfLookup(pdfFiles);
+        var entries = BuildEntries(parseRows, prefix, pdfLookup);
 
+        UploadResultDto result;
         try
         {
             _db.Ado.BeginTran();
@@ -117,6 +144,7 @@ public class UploadProcessingService
             await _db.Updateable(batch).ExecuteCommandAsync();
 
             _db.Ado.CommitTran();
+            result = BuildResult(batch, entries);
         }
         catch (Exception ex)
         {
@@ -125,7 +153,8 @@ public class UploadProcessingService
             throw;
         }
 
-        return BuildResult(batch, entries);
+        TryDeleteZipFile(zipFilePath, safeFileName);
+        return result;
     }
 
     private string PrepareWorkspace()
@@ -150,10 +179,15 @@ public class UploadProcessingService
         foreach (var row in MiniExcel.Query(excelPath, useHeaderRow: false, startCell: "A1"))
         {
             rowIndex++;
-            var rowDict = (IDictionary<string, object>)row;
-            if (rowDict.Count == 0) continue;
-            
-            var raw = rowDict.Values.FirstOrDefault()?.ToString() ?? string.Empty;
+            var raw = string.Empty;
+            if (row is IDictionary<string, object> rowDict && rowDict.Count > 0)
+            {
+                raw = rowDict.Values.FirstOrDefault()?.ToString() ?? string.Empty;
+            }
+            else if (row != null)
+            {
+                raw = row.ToString() ?? string.Empty;
+            }
 
             var parsedRow = new ParsedRow
             {
@@ -163,11 +197,15 @@ public class UploadProcessingService
 
             if (string.IsNullOrWhiteSpace(raw))
             {
+                parsedRow.RowType = RowType.Blank;
+                rows.Add(parsedRow);
                 continue;
             }
 
             if (raw.Contains("序号") && raw.Contains("品名"))
             {
+                parsedRow.RowType = RowType.Header;
+                rows.Add(parsedRow);
                 continue;
             }
 
@@ -183,6 +221,9 @@ public class UploadProcessingService
                 rows.Add(parsedRow);
                 continue;
             }
+
+            parsedRow.RowType = RowType.Footer;
+            rows.Add(parsedRow);
         }
 
         return rows;
@@ -227,10 +268,9 @@ public class UploadProcessingService
     private static List<UploadEntry> BuildEntries(
         List<ParsedRow> rows,
         string? prefix,
-        Dictionary<string, string> pdfLookup,
-        string extractPath)
+        IReadOnlyDictionary<string, string> pdfLookup)
     {
-        var entries = new List<UploadEntry>();
+        var entries = new List<UploadEntry>(rows.Count);
         foreach (var row in rows)
         {
             var entry = new UploadEntry
@@ -248,7 +288,15 @@ public class UploadProcessingService
 
             if (row.RowType != RowType.Data)
             {
-                entry.ParseStatus = ParseStatus.Parsed;
+                if (row.RowType == RowType.Blank || row.RowType == RowType.Header)
+                {
+                    entry.ParseStatus = ParseStatus.Parsed;
+                }
+                else
+                {
+                    entry.ParseStatus = ParseStatus.InvalidRow;
+                    entry.ErrorMessage = "行格式不匹配";
+                }
                 entries.Add(entry);
                 continue;
             }
@@ -261,7 +309,7 @@ public class UploadProcessingService
                 continue;
             }
 
-            var pdfName = $"{prefix}{row.SeqNo.Value:000}.pdf".ToLowerInvariant();
+            var pdfName = $"{prefix}{row.SeqNo.Value:000}.pdf";
             if (pdfLookup.TryGetValue(pdfName, out var pdfPath))
             {
                 entry.PdfFileName = Path.GetFileName(pdfPath);
@@ -278,6 +326,37 @@ public class UploadProcessingService
         }
 
         return entries;
+    }
+
+    private static IReadOnlyDictionary<string, string> BuildPdfLookup(IEnumerable<string> pdfFiles)
+    {
+        var lookup = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in pdfFiles)
+        {
+            var name = Path.GetFileName(file);
+            if (!lookup.ContainsKey(name))
+            {
+                lookup[name] = file;
+            }
+        }
+
+        return lookup;
+    }
+
+    private void TryDeleteZipFile(string zipFilePath, string fileName)
+    {
+        try
+        {
+            if (File.Exists(zipFilePath))
+            {
+                File.Delete(zipFilePath);
+                _logger.LogInformation("已删除原始ZIP文件: {FileName}", fileName);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "删除ZIP文件失败: {FileName}", fileName);
+        }
     }
 
     private static UploadResultDto BuildResult(UploadBatch batch, List<UploadEntry> entries)
@@ -317,7 +396,7 @@ public class UploadProcessingService
     {
         public int RowIndex { get; set; }
         public string? RawText { get; set; }
-        public RowType RowType { get; set; }
+        public RowType RowType { get; set; } = RowType.Blank;
         public int? SeqNo { get; set; }
         public string? ProductName { get; set; }
         public string? Model { get; set; }
