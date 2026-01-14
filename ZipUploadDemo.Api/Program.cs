@@ -52,7 +52,7 @@ builder.Services.AddSingleton<ISqlSugarClient>(sp =>
     };
 
     // Code First: 初始化数据库表
-    client.CodeFirst.InitTables<UploadBatch, UploadEntry, UploadJobEntity>();
+    client.CodeFirst.InitTables<UploadBatch, UploadEntry, UploadJobEntity, DownloadJobEntity>();
     return client;
 });
 
@@ -76,6 +76,8 @@ builder.Services.AddCap(x =>
 builder.Services.AddScoped<UploadProcessingService>();
 builder.Services.AddScoped<UploadQueryService>();
 builder.Services.AddScoped<UploadMessageConsumer>(); // 注册消费者
+builder.Services.AddScoped<DownloadCompressionService>();
+builder.Services.AddScoped<DownloadMessageConsumer>();
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();

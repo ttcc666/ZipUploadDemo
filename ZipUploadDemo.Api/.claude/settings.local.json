@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-Date)",
+      "Bash(Get-ChildItem -Path \"D:\\\\Study\\\\Demo\\\\ZipUploadDemo\\\\ZipUploadDemo.Api\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Get-ChildItem -Path \"D:\\\\Study\\\\Demo\\\\ZipUploadDemo\\\\ZipUploadDemo.Api\" -Recurse -Filter \"*.cs\")",
+      "Bash(Select-Object FullName)",
+      "Bash(Format-Table -HideTableHeaders)",
+      "Bash(dotnet build:*)",
+      "Bash(Get-ChildItem -Path .. -Filter \"wwwroot\" -Directory -Recurse -Depth 2)"
+    ]
+  }
+}

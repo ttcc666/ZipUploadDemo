@@ -63,9 +63,6 @@ public class UploadMessageConsumer : ICapSubscribe
                      .ExecuteCommandAsync();
 
             _logger.LogInformation("[CAP] 任务完成: {JobId}, BatchId: {BatchId}", jobMsg.JobId, result.BatchId);
-
-            // 清理临时文件
-            CleanupWorkspace(jobMsg.Workspace);
         }
         catch (Exception ex)
         {

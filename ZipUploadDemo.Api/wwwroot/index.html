@@ -346,9 +346,14 @@
                                             </td>
                                             <td>{{ formatDate(batch.createdAt) }}</td>
                                             <td>
-                                                <button class="btn btn-sm btn-outline-info" @click="viewDetails(batch)">
-                                                    详情
-                                                </button>
+                                                <div class="btn-group btn-group-sm" role="group">
+                                                    <button class="btn btn-outline-info" @click="viewDetails(batch)" title="查看详情">
+                                                        <i class="bi bi-eye"></i> 详情
+                                                    </button>
+                                                    <button class="btn btn-outline-success" @click="downloadBatch(batch.id)" title="下载批次文件">
+                                                        <i class="bi bi-download"></i> 下载
+                                                    </button>
+                                                </div>
                                             </td>
                                         </tr>
                                         <tr v-if="history.items.length === 0">
@@ -371,6 +376,48 @@
                                 </li>
                             </ul>
                         </nav>
+
+                        <!-- 下载任务监控 -->
+                        <div v-if="downloadJob" class="card mt-4 shadow-sm border-success">
+                            <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
+                                <h5 class="mb-0"><i class="bi bi-file-earmark-zip me-2"></i>文件压缩进度</h5>
+                                <span class="badge bg-light text-dark">{{ getDownloadStatusText(downloadJob.status) }}</span>
+                            </div>
+                            <div class="card-body">
+                                <p><strong>批次号:</strong> {{ downloadJob.batchNo }}</p>
+                                <p class="small text-muted mb-2">任务 ID: {{ downloadJob.jobId }}</p>
+
+                                <div class="progress mb-3" style="height: 25px;">
+                                    <div class="progress-bar progress-bar-striped progress-bar-animated"
+                                         :class="getDownloadProgressBarClass(downloadJob.status)"
+                                         :style="{width: downloadJob.progress + '%'}">
+                                        {{ downloadJob.progress }}%
+                                    </div>
+                                </div>
+
+                                <div v-if="downloadJob.status === 2" class="alert alert-success d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <i class="bi bi-check-circle-fill me-2"></i>
+                                        <span>压缩完成! 文件大小: {{ formatFileSize(downloadJob.zipFileSizeBytes) }}</span>
+                                        <div class="small text-muted mt-1">
+                                            总文件数: {{ downloadJob.totalFiles }}
+                                            <span v-if="downloadJob.missingFilesCount > 0" class="text-warning ms-2">
+                                                (缺失 {{ downloadJob.missingFilesCount }} 个文件)
+                                            </span>
+                                        </div>
+                                    </div>
+                                    <button class="btn btn-success" @click="downloadFile(downloadJob.jobId)">
+                                        <i class="bi bi-download me-1"></i>立即下载
+                                    </button>
+                                </div>
+                                <div v-else-if="downloadJob.status === 5" class="alert alert-danger">
+                                    <strong><i class="bi bi-x-circle-fill me-2"></i>失败:</strong> {{ downloadJob.errorMessage }}
+                                </div>
+                                <div v-else class="text-center text-muted">
+                                    <small>正在压缩文件，请稍候...</small>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </transition>
 
@@ -485,6 +532,10 @@
                     const queueStats = reactive({ total: 0, queued: 0, processing: 0, completed: 0, failed: 0, averageProcessingTimeSeconds: 0 });
                     let jobListRefreshInterval = null;
 
+                    // Download State
+                    const downloadJob = ref(null);
+                    let downloadMonitorInterval = null;
+
                     // --- Utilities ---
                     const formatDate = (dateStr) => {
                         if (!dateStr) return '-';
@@ -497,6 +548,14 @@
                     const showError = (msg) => {
                         errorMessage.value = msg;
                         setTimeout(() => errorMessage.value = '', 5000);
+                    };
+
+                    const formatFileSize = (bytes) => {
+                        if (!bytes || bytes === 0) return '0 B';
+                        const k = 1024;
+                        const sizes = ['B', 'KB', 'MB', 'GB'];
+                        const i = Math.floor(Math.log(bytes) / Math.log(k));
+                        return (bytes / Math.pow(k, i)).toFixed(2) + ' ' + sizes[i];
                     };
 
                     const handleFileSelect = (event) => {
@@ -631,6 +690,66 @@
                          } catch(e) {}
                     };
 
+                    // --- Download Logic ---
+
+                    const downloadBatch = async (batchId) => {
+                        try {
+                            loading.value = true;
+                            const res = await axios.post(`/api/download/batches/${batchId}`);
+
+                            if (res.data?.jobId) {
+                                // Start monitoring download job
+                                startDownloadMonitoring(res.data.jobId);
+                            }
+                        } catch (error) {
+                            console.error(error);
+                            showError("创建下载任务失败: " + (error.response?.data?.message || error.message));
+                        } finally {
+                            loading.value = false;
+                        }
+                    };
+
+                    const startDownloadMonitoring = (jobId) => {
+                        // Initial state
+                        downloadJob.value = {
+                            jobId: jobId,
+                            status: 0,
+                            progress: 0,
+                            batchNo: '加载中...'
+                        };
+
+                        // Clear existing monitor if any
+                        if (downloadMonitorInterval) clearInterval(downloadMonitorInterval);
+
+                        // Poll every 1s
+                        downloadMonitorInterval = setInterval(async () => {
+                            try {
+                                const res = await axios.get(`/api/download/jobs/${jobId}`);
+                                downloadJob.value = res.data;
+
+                                // Stop if terminal state
+                                if (res.data.status === 2 || res.data.status === 5) {
+                                    clearInterval(downloadMonitorInterval);
+                                    downloadMonitorInterval = null;
+                                }
+                            } catch (e) {
+                                console.error("Download monitor failed", e);
+                            }
+                        }, 1000);
+                    };
+
+                    const downloadFile = (jobId) => {
+                        // Trigger browser download
+                        window.location.href = `/api/download/jobs/${jobId}/file`;
+
+                        // Clear download job after a delay
+                        setTimeout(() => {
+                            downloadJob.value = null;
+                        }, 3000);
+                    };
+
+                    // --- Job Queue Logic ---
+
                     const loadJobs = async () => {
                         loading.value = true;
                         currentView.value = 'jobs';
@@ -668,6 +787,7 @@
                     onUnmounted(() => {
                         if (monitorInterval) clearInterval(monitorInterval);
                         if (jobListRefreshInterval) clearInterval(jobListRefreshInterval);
+                        if (downloadMonitorInterval) clearInterval(downloadMonitorInterval);
                     });
 
                     // --- Display Helpers ---
@@ -690,6 +810,14 @@
                          return {0: "未解析", 1: "解析成功", 2: "缺失 PDF", 3: "无效数据"}[status] || "未知";
                     };
 
+                    const getDownloadStatusText = (status) => {
+                        return {0: "等待中", 1: "压缩中", 2: "准备就绪", 3: "已下载", 4: "已过期", 5: "失败"}[status] || "未知";
+                    };
+
+                    const getDownloadProgressBarClass = (status) => {
+                        return {0: "bg-secondary", 1: "bg-primary", 2: "bg-success", 5: "bg-danger"}[status] || "bg-primary";
+                    };
+
                     return {
                         currentView, loading, errorMessage,
                         fileInput, selectedFile, handleFileSelect, uploadFile,
@@ -697,7 +825,9 @@
                         history, historySearch, loadHistory,
                         selectedBatch, details, viewDetails, loadDetails, viewBatchDetails,
                         jobs, queueStats, loadJobs,
-                        formatDate, getJobStatusText, getJobStatusBadgeClass, getProgressBarClass, getStatusClass, getStatusIcon, getParseStatusText
+                        downloadJob, downloadBatch, downloadFile,
+                        formatDate, formatFileSize, getJobStatusText, getJobStatusBadgeClass, getProgressBarClass, getStatusClass, getStatusIcon, getParseStatusText,
+                        getDownloadStatusText, getDownloadProgressBarClass
                     };
                 }
             }).mount('#app');

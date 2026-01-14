@@ -195,20 +195,6 @@ public class UploadProcessingService
                 RawText = raw
             };
 
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                parsedRow.RowType = RowType.Blank;
-                rows.Add(parsedRow);
-                continue;
-            }
-
-            if (raw.Contains("序号") && raw.Contains("品名"))
-            {
-                parsedRow.RowType = RowType.Header;
-                rows.Add(parsedRow);
-                continue;
-            }
-
             var match = DataRegex.Match(raw);
             if (match.Success)
             {
@@ -222,8 +208,6 @@ public class UploadProcessingService
                 continue;
             }
 
-            parsedRow.RowType = RowType.Footer;
-            rows.Add(parsedRow);
         }
 
         return rows;
